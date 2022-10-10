@@ -45,6 +45,7 @@ import java.io.EOFException;
 import java.io.IOException;
 import java.util.Collection;
 import java.util.List;
+import java.util.Objects;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executor;
 import java.util.concurrent.Future;
@@ -71,7 +72,7 @@ public class LeaderLatch implements Closeable
     private final AtomicBoolean hasLeadership = new AtomicBoolean(false);
     private final AtomicReference<String> ourPath = new AtomicReference<String>();
     private final AtomicReference<String> lastPathIsLeader = new AtomicReference<String>();
-    private final StandardListenerManager<LeaderLatchListener> listeners = StandardListenerManager.standard();
+    private final StandardListenerManager<EpochLeaderLatchListener> listeners = StandardListenerManager.standard();
     private final CloseMode closeMode;
     private final AtomicReference<Future<?>> startTask = new AtomicReference<Future<?>>();
 
@@ -245,7 +246,7 @@ public class LeaderLatch implements Closeable
             {
             case NOTIFY_LEADER:
             {
-                setLeadership(false);
+                setLeadership(-1, false);
                 listeners.clear();
                 break;
             }
@@ -253,7 +254,7 @@ public class LeaderLatch implements Closeable
             default:
             {
                 listeners.clear();
-                setLeadership(false);
+                setLeadership(-1, false);
                 break;
             }
             }
@@ -286,6 +287,15 @@ public class LeaderLatch implements Closeable
      */
     public void addListener(LeaderLatchListener listener)
     {
+        listeners.addListener(new EpochLeaderLatchListenerAdapter(listener));
+    }
+
+    /**
+     * Same as {@link #addListener(LeaderLatchListener)} but with an {@link EpochLeaderLatchListener}
+     * that receives an epoch value when it gains leadership.
+     */
+    public void addListener(EpochLeaderLatchListener listener)
+    {
         listeners.addListener(listener);
     }
 
@@ -304,6 +314,15 @@ public class LeaderLatch implements Closeable
      */
     public void addListener(LeaderLatchListener listener, Executor executor)
     {
+        listeners.addListener(new EpochLeaderLatchListenerAdapter(listener), executor);
+    }
+
+    /**
+     * Same as {@link #addListener(LeaderLatchListener, Executor)} but with an {@link EpochLeaderLatchListener}
+     * that receives an epoch value when it gains leadership.
+     */
+    public void addListener(EpochLeaderLatchListener listener, Executor executor)
+    {
         listeners.addListener(listener, executor);
     }
 
@@ -314,6 +333,15 @@ public class LeaderLatch implements Closeable
      */
     public void removeListener(LeaderLatchListener listener)
     {
+        listeners.removeListener(new EpochLeaderLatchListenerAdapter(listener));
+    }
+
+    /**
+     * Removes a given epoch listener from this LeaderLatch
+     *
+     * @param listener the epoch listener to remove
+     */
+    public void removeListener(EpochLeaderLatchListener listener) {
         listeners.removeListener(listener);
     }
 
@@ -543,7 +571,7 @@ public class LeaderLatch implements Closeable
     @VisibleForTesting
     void reset() throws Exception
     {
-        setLeadership(false);
+        setLeadership(-1, false);
         setNode(null);
 
         BackgroundCallback callback = new BackgroundCallback()
@@ -598,7 +626,7 @@ public class LeaderLatch implements Closeable
     @VisibleForTesting
     volatile CountDownLatch debugCheckLeaderShipLatch = null;
 
-    private void checkLeadership(List<String> children) throws Exception
+    private void checkLeadership(int epoch, List<String> children) throws Exception
     {
         if ( debugCheckLeaderShipLatch != null )
         {
@@ -619,7 +647,7 @@ public class LeaderLatch implements Closeable
         else if ( ourIndex == 0 )
         {
             lastPathIsLeader.set(localOurPath);
-            setLeadership(true);
+            setLeadership(epoch, true);
         }
         else
         {
@@ -670,7 +698,7 @@ public class LeaderLatch implements Closeable
             {
                 if ( event.getResultCode() == KeeperException.Code.OK.intValue() )
                 {
-                    checkLeadership(event.getChildren());
+                    checkLeadership(event.getStat().getCversion(), event.getChildren());
                 }
             }
         };
@@ -701,7 +729,7 @@ public class LeaderLatch implements Closeable
                 {
                     ThreadUtils.checkInterrupted(e);
                     log.error("Could not reset leader latch", e);
-                    setLeadership(false);
+                    setLeadership(-1, false);
                 }
                 break;
             }
@@ -710,30 +738,30 @@ public class LeaderLatch implements Closeable
             {
                 if ( client.getConnectionStateErrorPolicy().isErrorState(ConnectionState.SUSPENDED) )
                 {
-                    setLeadership(false);
+                    setLeadership(-1, false);
                 }
                 break;
             }
 
             case LOST:
             {
-                setLeadership(false);
+                setLeadership(-1, false);
                 break;
             }
         }
     }
 
-    private synchronized void setLeadership(boolean newValue)
+    private synchronized void setLeadership(int epoch, boolean newValue)
     {
         boolean oldValue = hasLeadership.getAndSet(newValue);
 
         if ( oldValue && !newValue )
         { // Lost leadership, was true, now false
-            listeners.forEach(LeaderLatchListener::notLeader);
+            listeners.forEach(EpochLeaderLatchListener::notLeader);
         }
         else if ( !oldValue && newValue )
         { // Gained leadership, was false, now true
-            listeners.forEach(LeaderLatchListener::isLeader);
+            listeners.forEach(leaderLatchListener -> leaderLatchListener.isLeader(epoch));
         }
 
         notifyAll();
@@ -746,6 +774,39 @@ public class LeaderLatch implements Closeable
         if ( oldPath != null )
         {
             client.delete().guaranteed().inBackground().forPath(oldPath);
+        }
+    }
+
+    private static class EpochLeaderLatchListenerAdapter implements EpochLeaderLatchListener {
+        private final LeaderLatchListener delegate;
+
+        public EpochLeaderLatchListenerAdapter(LeaderLatchListener delegate) {
+            this.delegate = delegate;
+        }
+
+        @Override
+        public void isLeader(int epoch) {
+            delegate.isLeader();
+        }
+
+        @Override
+        public void notLeader() {
+            delegate.notLeader();
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) return true;
+            if (o == null || getClass() != o.getClass()) return false;
+
+            EpochLeaderLatchListenerAdapter that = (EpochLeaderLatchListenerAdapter) o;
+
+            return Objects.equals(delegate, that.delegate);
+        }
+
+        @Override
+        public int hashCode() {
+            return delegate != null ? delegate.hashCode() : 0;
         }
     }
 }

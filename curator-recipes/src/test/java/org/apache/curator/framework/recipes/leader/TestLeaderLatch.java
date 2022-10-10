@@ -828,12 +828,12 @@ public class TestLeaderLatch extends BaseClassForTests
             LeaderLatch.CloseMode closeMode = i < SILENT_QTY ? LeaderLatch.CloseMode.SILENT : LeaderLatch.CloseMode.NOTIFY_LEADER;
 
             final LeaderLatch latch = new LeaderLatch(client, PATH_NAME, "", closeMode);
-            latch.addListener(new LeaderLatchListener()
+            latch.addListener(new EpochLeaderLatchListener()
             {
                 boolean beenLeader = false;
 
                 @Override
-                public void isLeader()
+                public void isLeader(int epoch)
                 {
                     if ( !beenLeader )
                     {
